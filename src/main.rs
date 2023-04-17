@@ -25,6 +25,7 @@ use vulkanalia::vk::{ExtDebugUtilsExtension, ExtShaderObjectExtension, QueueFlag
 use vulkanalia::vk::KhrSurfaceExtension;
 use vulkanalia::vk::KhrSwapchainExtension;
 use std::mem::size_of;
+use std::ops::BitOr;
 use std::ptr::copy_nonoverlapping as memcpy;
 
 use nalgebra_glm as glm;
@@ -38,11 +39,14 @@ const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 lazy_static! {
     static ref VERTICES: Vec<Vertex> = vec![
-        Vertex::new(glm::vec2(0.0, -0.2), glm::vec3(1.0, 1.0, 1.0)),
-        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 1.0, 0.0)),
-        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(0.0, 0.0, 1.0)),
+        Vertex::new(glm::vec2(-0.5, -0.5), glm::vec3(1.0, 0.0, 0.0)),
+        Vertex::new(glm::vec2(0.5, -0.5), glm::vec3(0.0, 1.0, 0.0)),
+        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 0.0, 1.0)),
+        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(1.0, 1.0, 1.0)),
     ];
 }
+const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0]; // Possible to use u16 or u32 here, however since we have less than 65,536 unique verts we are fine with u16
+
 
 fn main() -> Result<()> {
 	pretty_env_logger::init();
@@ -116,6 +120,7 @@ impl App {
 		create_framebuffers(&device, &mut data)?;
 		create_command_pool(&instance, &device, &mut data)?;
 		create_vertex_buffer(&instance, &device, &mut data)?;
+		create_index_buffer(&instance, &device, &mut data)?;
 		create_command_buffers(&device, &mut data)?;
 		create_sync_objects(&device, &mut data)?;
 
@@ -220,6 +225,8 @@ impl App {
 		self.destroy_swapchain();
 		self.device.destroy_buffer(self.data.vertex_buffer, None);
 		self.device.free_memory(self.data.vertex_buffer_memory, None);
+		self.device.destroy_buffer(self.data.index_buffer, None);
+		self.device.free_memory(self.data.index_buffer_memory, None);
 
 		self.data.in_flight_fences
 			.iter()
@@ -242,43 +249,147 @@ impl App {
 	}
 }
 
+unsafe fn create_index_buffer(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> {
+	let size = (size_of::<u16>() * INDICES.len()) as u64;
+
+	let (staging_buffer, staging_buffer_memory) = create_buffer(
+		instance,
+		device,
+		data,
+		size,
+		vk::BufferUsageFlags::TRANSFER_SRC,
+		vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE
+	)?;
+
+	let memory = device.map_memory(
+		staging_buffer_memory,
+		0,
+		size,
+		vk::MemoryMapFlags::empty(),
+	)?;
+
+	memcpy(INDICES.as_ptr(), memory.cast(), INDICES.len());
+
+	device.unmap_memory(staging_buffer_memory);
+
+	let (index_buffer, index_buffer_memory) = create_buffer(
+		instance,
+		device,
+		data,
+		size,
+		vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+		vk::MemoryPropertyFlags::DEVICE_LOCAL,
+	)?;
+
+	data.index_buffer = index_buffer;
+	data.index_buffer_memory = index_buffer_memory;
+
+	copy_buffer(device, data, staging_buffer, index_buffer, size)?;
+
+	device.destroy_buffer(staging_buffer, None);
+	device.free_memory(staging_buffer_memory, None);
+
+	Ok(())
+}
+
 unsafe fn create_vertex_buffer(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> {
+	let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+
+	let (staging_buffer, staging_buffer_memory) = create_buffer(
+		instance,
+		device,
+		data,
+		size,
+		vk::BufferUsageFlags::TRANSFER_SRC,
+		vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE
+	)?;
+
+	let memory = device.map_memory(
+		staging_buffer_memory,
+		0,
+		size,
+		vk::MemoryMapFlags::empty(),
+	)?;
+
+	memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+
+	device.unmap_memory(staging_buffer_memory);
+
+	let (vertex_buffer, vertex_buffer_memory) = create_buffer(
+		instance,
+		device,
+		data,
+		size,
+		vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+		vk::MemoryPropertyFlags::DEVICE_LOCAL
+	)?;
+
+	data.vertex_buffer = vertex_buffer;
+	data.vertex_buffer_memory = vertex_buffer_memory;
+
+	copy_buffer(device, data, staging_buffer, vertex_buffer, size)?;
+
+	device.destroy_buffer(staging_buffer, None);
+	device.free_memory(staging_buffer_memory, None);
+
+	Ok(())
+}
+
+unsafe fn copy_buffer(device: &Device, data: &AppData, source: vk::Buffer, destination: vk::Buffer, size: vk::DeviceSize) -> Result<()> {
+	let info = vk::CommandBufferAllocateInfo::builder()
+		.level(vk::CommandBufferLevel::PRIMARY)
+		.command_pool(data.command_pool)
+		.command_buffer_count(1);
+
+	let command_buffer = device.allocate_command_buffers(&info)?[0];
+	let info = vk::CommandBufferBeginInfo::builder()
+		.flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+	device.begin_command_buffer(command_buffer, &info)?;
+	let regions = vk::BufferCopy::builder().size(size);
+	device.cmd_copy_buffer(command_buffer, source, destination, &[regions]);
+	device.end_command_buffer(command_buffer)?;
+
+	let command_buffers = &[command_buffer];
+	let info = vk::SubmitInfo::builder()
+		.command_buffers(command_buffers);
+
+	device.queue_submit(data.graphics_queue, &[info], vk::Fence::null())?;
+	device.queue_wait_idle(data.graphics_queue)?;
+	// If you used wait_for_fences, we could transfer multiple items simultaneously and wait for them to complete.
+
+	device.free_command_buffers(data.command_pool, &[command_buffer]);
+
+	Ok(())
+}
+
+unsafe fn create_buffer(instance: &Instance, device: &Device, data: &AppData, size: vk::DeviceSize, usage: vk::BufferUsageFlags, properties: vk::MemoryPropertyFlags) -> Result<(vk::Buffer, vk::DeviceMemory)> {
 	let buffer_info = vk::BufferCreateInfo::builder()
-		.size((size_of::<Vertex>() * VERTICES.len()) as u64)
-		.usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+		.size(size)
+		.usage(usage)
 		.sharing_mode(vk::SharingMode::EXCLUSIVE)
 		.flags(vk::BufferCreateFlags::empty()); // used to configure sparse buffer memory
 
-	data.vertex_buffer = device.create_buffer(&buffer_info, None)?;
+	let buffer = device.create_buffer(&buffer_info, None)?;
 
-	let requirements = device.get_buffer_memory_requirements(data.vertex_buffer);
+	let requirements = device.get_buffer_memory_requirements(buffer);
 
 	let memory_info = vk::MemoryAllocateInfo::builder()
 		.allocation_size(requirements.size)
 		.memory_type_index(get_memory_type_index(
 			instance,
 			data,
-			vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+			properties,
 			requirements,
 		)?);
 
-	data.vertex_buffer_memory = device.allocate_memory(&memory_info, None)?;
+	let buffer_memory = device.allocate_memory(&memory_info, None)?;
 
-	device.bind_buffer_memory(data.vertex_buffer, data.vertex_buffer_memory, 0)?;
+	device.bind_buffer_memory(buffer, buffer_memory, 0)?;
 
-	let memory = device.map_memory(
-		data.vertex_buffer_memory,
-		0,
-		buffer_info.size,
-		vk::MemoryMapFlags::empty(),
-	)?;
-
-	memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
-
-	device.unmap_memory(data.vertex_buffer_memory);
-
-	Ok(())
+	Ok((buffer, buffer_memory))
 }
+
 
 unsafe fn get_memory_type_index(instance: &Instance, data: &AppData, properties: vk::MemoryPropertyFlags, requirements: vk::MemoryRequirements) -> Result<u32> {
 	let memory = instance.get_physical_device_memory_properties(data.physical_device);
@@ -349,7 +460,8 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 		device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
 		device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
 		device.cmd_bind_vertex_buffers(*command_buffer, 0, &[data.vertex_buffer], &[0]);
-		device.cmd_draw(*command_buffer, VERTICES.len() as u32, 1, 0, 0);
+		device.cmd_bind_index_buffer(*command_buffer, data.index_buffer, 0, vk::IndexType::UINT16);
+		device.cmd_draw_indexed(*command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
 		device.cmd_end_render_pass(*command_buffer);
 		device.end_command_buffer(*command_buffer)?;
 	}
@@ -565,6 +677,8 @@ struct AppData {
 	images_in_flight: Vec<vk::Fence>,
 	vertex_buffer: vk::Buffer,
 	vertex_buffer_memory: vk::DeviceMemory,
+	index_buffer: vk::Buffer,
+	index_buffer_memory: vk::DeviceMemory,
 }
 
 unsafe fn create_instance(window: &Window, entry: &Entry, data: &mut AppData) -> Result<Instance> {
