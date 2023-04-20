@@ -28,9 +28,12 @@ use std::mem::size_of;
 use std::ptr::copy_nonoverlapping as memcpy;
 use std::time::Instant;
 use std::fs::File;
+use std::collections::HashMap;
+use std::default::Default;
+use std::hash::{Hash, Hasher};
+use std::io::BufReader;
 
 use nalgebra_glm as glm;
-use lazy_static::lazy_static;
 use png::Decoder;
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
@@ -38,17 +41,6 @@ const VALIDATION_ENABLED: bool = cfg!(debug_assertions);
 const VALIDATION_LAYER: vk::ExtensionName = vk::ExtensionName::from_bytes(b"VK_LAYER_KHRONOS_validation");
 const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.name];
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
-lazy_static! {
-    static ref VERTICES: Vec<Vertex> = vec![
-        Vertex::new(glm::vec2(-0.5, -0.5), glm::vec3(1.0, 0.0, 0.0), glm::vec2(1.0, 0.0)),
-        Vertex::new(glm::vec2(0.5, -0.5), glm::vec3(0.0, 1.0, 0.0), glm::vec2(0.0, 0.0)),
-        Vertex::new(glm::vec2(0.5, 0.5), glm::vec3(0.0, 0.0, 1.0), glm::vec2(0.0, 1.0)),
-        Vertex::new(glm::vec2(-0.5, 0.5), glm::vec3(1.0, 1.0, 1.0), glm::vec2(1.0, 1.0)),
-    ];
-}
-const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0]; // Possible to use u16 or u32 here, however since we have less than 65,536 unique verts we are fine with u16
-
 
 fn main() -> Result<()> {
 	pretty_env_logger::init();
@@ -121,11 +113,13 @@ impl App {
 		create_render_pass(&instance, &device, &mut data)?;
 		create_descriptor_set_layout(&device, &mut data)?;
 		create_pipeline(&device, &mut data)?;
-		create_framebuffers(&device, &mut data)?;
 		create_command_pool(&instance, &device, &mut data)?;
+		create_depth_objects(&instance, &device, &mut data)?;
+		create_framebuffers(&device, &mut data)?;
 		create_texture_image(&instance, &device, &mut data)?;
 		create_texture_image_view(&device, &mut data)?;
 		create_texture_sampler(&device, &mut data)?;
+		load_model(&mut data)?;
 		create_vertex_buffer(&instance, &device, &mut data)?;
 		create_index_buffer(&instance, &device, &mut data)?;
 		create_uniform_buffers(&instance, &device, &mut data)?;
@@ -220,7 +214,8 @@ impl App {
 			&glm::vec3(0.0, 0.0, 1.0),
 		);
 
-		let mut proj = glm::perspective(
+		// perspective_rh_zo (zo = zero-to-one), vulkan 0.0, 1.0 ranges
+		let mut proj = glm::perspective_rh_zo(
 			self.data.swapchain_extent.width as f32 / self.data.swapchain_extent.height as f32,
 			glm::radians(&glm::vec1(45.0))[0],
 			0.1,
@@ -248,17 +243,18 @@ impl App {
 	unsafe fn recreate_swapchain(&mut self, window: &Window) -> Result<()> {
 		self.device.device_wait_idle()?;
 		self.destroy_swapchain();
+		warn!("Recreating swapchain!");
 		create_swapchain(window, &self.instance, &self.device, &mut self.data)?;
 		create_swapchain_image_views(&self.device, &mut self.data)?;
 		create_render_pass(&self.instance, &self.device, &mut self.data)?;
 		create_pipeline(&self.device, &mut self.data)?;
+		create_depth_objects(&self.instance, &self.device, &mut self.data)?;
 		create_framebuffers(&self.device, &mut self.data)?;
 		create_uniform_buffers(&self.instance, &self.device, &mut self.data)?;
 		create_descriptor_pool(&self.device, &mut self.data)?;
 		create_descriptor_sets(&self.device, &mut self.data)?;
 		create_command_buffers(&self.device, &mut self.data)?;
 		self.data.images_in_flight.resize(self.data.swapchain_images.len(), vk::Fence::null());
-
 		Ok(())
 	}
 
@@ -270,6 +266,9 @@ impl App {
 		self.data.uniform_buffers_memory
 			.iter()
 			.for_each(|m| self.device.free_memory(*m, None));
+		self.device.destroy_image_view(self.data.depth_image_view, None);
+		self.device.free_memory(self.data.depth_image_memory, None);
+		self.device.destroy_image(self.data.depth_image, None);
 		self.data.framebuffers
 			.iter()
 			.for_each(|f| self.device.destroy_framebuffer(*f, None));
@@ -316,6 +315,98 @@ impl App {
 	}
 }
 
+fn load_model(data: &mut AppData) -> Result<()> {
+	let mut reader = BufReader::new(File::open("resources/viking_room.obj")?);
+
+	let (models, _) = tobj::load_obj_buf(
+		&mut reader,
+		&tobj::LoadOptions { triangulate: true, ..Default::default() },
+		|_| Ok(Default::default()),
+	)?;
+
+	let mut unique_vertices = HashMap::new();
+
+	for model in &models {
+		for index in &model.mesh.indices {
+			let pos_offset = (3 * index) as usize;
+			let tex_coord_offset = (2 * index) as usize;
+
+			let vertex = Vertex {
+				pos: glm::vec3(model.mesh.positions[pos_offset], model.mesh.positions[pos_offset + 1], model.mesh.positions[pos_offset + 2]),
+				colour: glm::vec3(1.0, 1.0, 1.0),
+				tex_coord: glm::vec2(
+					model.mesh.texcoords[tex_coord_offset],
+					1.0 - model.mesh.texcoords[tex_coord_offset + 1]
+				),
+			};
+
+			if let Some(index) = unique_vertices.get(&vertex) {
+				data.indices.push(*index as u32);
+			} else {
+				let index = data.vertices.len();
+				unique_vertices.insert(vertex, index);
+				data.vertices.push(vertex);
+				data.indices.push(index as u32);
+			}
+		}
+	}
+
+	Ok(())
+}
+
+unsafe fn create_depth_objects(instance: &Instance, device: &Device, data: &mut AppData, ) -> Result<()> {
+	let format = get_depth_format(instance, data)?;
+	warn!("{:?}", format);
+
+	let (depth_image, depth_image_memory) = create_image(
+		instance,
+		device,
+		data,
+		data.swapchain_extent.width,
+		data.swapchain_extent.height,
+		format,
+		vk::ImageTiling::OPTIMAL,
+		vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+		vk::MemoryPropertyFlags::DEVICE_LOCAL
+	)?;
+
+	data.depth_image = depth_image;
+	data.depth_image_memory = depth_image_memory;
+
+	data.depth_image_view = create_image_view(device, data.depth_image, format, vk::ImageAspectFlags::DEPTH)?;
+
+	// transition_image_layout(device, data, data.depth_image, format, vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)?;
+
+
+	Ok(())
+}
+
+unsafe fn get_supported_format(instance: &Instance, data: &AppData, candidates: &[vk::Format], tiling: vk::ImageTiling, features: vk::FormatFeatureFlags) -> Result<vk::Format> {
+	candidates
+		.iter()
+		.cloned()
+		.find(|f| {
+			let properties = instance.get_physical_device_format_properties(data.physical_device, *f);
+
+			match tiling {
+				vk::ImageTiling::LINEAR => properties.linear_tiling_features.contains(features),
+				vk::ImageTiling::OPTIMAL => properties.optimal_tiling_features.contains(features),
+				_ => false
+			}
+		})
+		.ok_or_else(|| anyhow!("Failed to find supported format!"))
+}
+
+unsafe fn get_depth_format(instance: &Instance, data: &AppData) -> Result<vk::Format> {
+	let candidates = &[
+		vk::Format::D32_SFLOAT,
+		vk::Format::D32_SFLOAT_S8_UINT,
+		vk::Format::D24_UNORM_S8_UINT,
+	];
+
+	get_supported_format(instance, data, candidates, vk::ImageTiling::OPTIMAL, vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+}
+
 unsafe fn create_texture_sampler(device: &Device, data: &mut AppData) -> Result<()> {
 	let info = vk::SamplerCreateInfo::builder()
 		.mag_filter(vk::Filter::LINEAR)
@@ -344,12 +435,13 @@ unsafe fn create_texture_image_view(device: &Device, data: &mut AppData) -> Resu
 		device,
 		data.texture_image,
 		vk::Format::R8G8B8A8_SRGB,
+		vk::ImageAspectFlags::COLOR
 	)?;
 
 	Ok(())
 }
 
-unsafe fn create_image_view(device: &Device, image: vk::Image, format: vk::Format) -> Result<vk::ImageView> {
+unsafe fn create_image_view(device: &Device, image: vk::Image, format: vk::Format, aspects: vk::ImageAspectFlags) -> Result<vk::ImageView> {
 	// Components default to identity
 	let components = vk::ComponentMapping::builder()
 		.r(vk::ComponentSwizzle::IDENTITY)
@@ -358,7 +450,7 @@ unsafe fn create_image_view(device: &Device, image: vk::Image, format: vk::Forma
 		.a(vk::ComponentSwizzle::IDENTITY);
 
 	let subresource_range = vk::ImageSubresourceRange::builder()
-		.aspect_mask(vk::ImageAspectFlags::COLOR)
+		.aspect_mask(aspects)
 		.base_mip_level(0)
 		.level_count(1)
 		.base_array_layer(0)
@@ -456,7 +548,7 @@ unsafe fn copy_buffer_to_image(device: &Device, data: &AppData, buffer: vk::Buff
 }
 
 unsafe fn create_texture_image(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> {
-	let image = File::open("resources/texture.png")?;
+	let image = File::open("resources/viking_room.png")?;
 	let decoder = Decoder::new(image);
 	let mut reader = decoder.read_info()?;
 
@@ -678,7 +770,7 @@ unsafe fn create_descriptor_set_layout(device: &Device, data: &mut AppData) -> R
 }
 
 unsafe fn create_index_buffer(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> {
-	let size = (size_of::<u16>() * INDICES.len()) as u64;
+	let size = (size_of::<u32>() * data.indices.len()) as u64;
 
 	let (staging_buffer, staging_buffer_memory) = create_buffer(
 		instance,
@@ -696,7 +788,7 @@ unsafe fn create_index_buffer(instance: &Instance, device: &Device, data: &mut A
 		vk::MemoryMapFlags::empty(),
 	)?;
 
-	memcpy(INDICES.as_ptr(), memory.cast(), INDICES.len());
+	memcpy(data.indices.as_ptr(), memory.cast(), data.indices.len());
 
 	device.unmap_memory(staging_buffer_memory);
 
@@ -721,7 +813,7 @@ unsafe fn create_index_buffer(instance: &Instance, device: &Device, data: &mut A
 }
 
 unsafe fn create_vertex_buffer(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> {
-	let size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+	let size = (size_of::<Vertex>() * data.vertices.len()) as u64;
 
 	let (staging_buffer, staging_buffer_memory) = create_buffer(
 		instance,
@@ -739,7 +831,7 @@ unsafe fn create_vertex_buffer(instance: &Instance, device: &Device, data: &mut 
 		vk::MemoryMapFlags::empty(),
 	)?;
 
-	memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+	memcpy(data.vertices.as_ptr(), memory.cast(), data.vertices.len());
 
 	device.unmap_memory(staging_buffer_memory);
 
@@ -861,7 +953,14 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 			}
 		};
 
-		let clear_values = &[color_clear_value];
+		let depth_clear_value = vk::ClearValue {
+			depth_stencil: vk::ClearDepthStencilValue {
+				depth: 1.0, //Range of 0.0 - 1.0. 1.0 Lies at the far view plane, and 0.0 at the near view plane
+				stencil: 0,
+			}
+		};
+
+		let clear_values = &[color_clear_value, depth_clear_value];
 		let info = vk::RenderPassBeginInfo::builder()
 			.render_pass(data.render_pass)
 			.framebuffer(data.framebuffers[i])
@@ -871,7 +970,7 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 		device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
 		device.cmd_bind_pipeline(*command_buffer, vk::PipelineBindPoint::GRAPHICS, data.pipeline);
 		device.cmd_bind_vertex_buffers(*command_buffer, 0, &[data.vertex_buffer], &[0]);
-		device.cmd_bind_index_buffer(*command_buffer, data.index_buffer, 0, vk::IndexType::UINT16);
+		device.cmd_bind_index_buffer(*command_buffer, data.index_buffer, 0, vk::IndexType::UINT32);
 		device.cmd_bind_descriptor_sets(
 			*command_buffer,
 			vk::PipelineBindPoint::GRAPHICS,
@@ -880,7 +979,7 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 			&[data.descriptor_sets[i]],
 			&[]
 		);
-		device.cmd_draw_indexed(*command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+		device.cmd_draw_indexed(*command_buffer, data.indices.len() as u32, 1, 0, 0, 0);
 		device.cmd_end_render_pass(*command_buffer);
 		device.end_command_buffer(*command_buffer)?;
 	}
@@ -915,20 +1014,35 @@ unsafe fn create_render_pass(instance: &Instance, device: &Device, data: &mut Ap
 		.attachment(0)
 		.layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
 
+	let depth_stencil_attachment = vk::AttachmentDescription::builder()
+		.format(get_depth_format(instance, data)?)
+		.samples(vk::SampleCountFlags::_1)
+		.load_op(vk::AttachmentLoadOp::CLEAR)
+		.store_op(vk::AttachmentStoreOp::DONT_CARE)
+		.stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+		.stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+		.initial_layout(vk::ImageLayout::UNDEFINED)
+		.final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+	let depth_stencil_attachment_ref = vk::AttachmentReference::builder()
+		.attachment(1)
+		.layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
 	let color_attachments = &[color_attachment_ref];
 	let subpass = vk::SubpassDescription::builder()
 		.pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-		.color_attachments(color_attachments);
+		.color_attachments(color_attachments)
+		.depth_stencil_attachment(&depth_stencil_attachment_ref); // Can only have a single attachment
 
 	let dependency = vk::SubpassDependency::builder()
 		.src_subpass(vk::SUBPASS_EXTERNAL)
 		.dst_subpass(0)
 		.src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
 		.src_access_mask(vk::AccessFlags::empty())
-		.dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-		.dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+		.dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS)
+		.dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
 
-	let attachments = &[color_attachment];
+	let attachments = &[color_attachment, depth_stencil_attachment];
 	let subpasses = &[subpass];
 	let dependencies = &[dependency];
 	let info = vk::RenderPassCreateInfo::builder()
@@ -938,7 +1052,6 @@ unsafe fn create_render_pass(instance: &Instance, device: &Device, data: &mut Ap
 
 
 	data.render_pass = device.create_render_pass(&info, None)?;
-
 
 	Ok(())
 }
@@ -980,7 +1093,7 @@ unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
 		.width(data.swapchain_extent.width as f32)
 		.height(data.swapchain_extent.height as f32)
 		.min_depth(0.0)
-		.max_depth(0.0);
+		.max_depth(1.0);
 
 	let viewports = &[viewport];
 	let scissors = &[scissor];
@@ -1000,6 +1113,15 @@ unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
 	let multisample_state = vk::PipelineMultisampleStateCreateInfo::builder()
 		.sample_shading_enable(false)
 		.rasterization_samples(vk::SampleCountFlags::_1);
+
+	let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::builder()
+		.depth_test_enable(true)
+		.depth_write_enable(true)
+		.depth_compare_op(vk::CompareOp::LESS)
+		.depth_bounds_test_enable(false)
+		.stencil_test_enable(false);
+	//.front(/* vk::StencilOpState */) // Optional
+	//.back(/* vk::StencilOpState */) // Optional
 
 	let attachment = vk::PipelineColorBlendAttachmentState::builder()
 		.color_write_mask(vk::ColorComponentFlags::all())
@@ -1025,6 +1147,7 @@ unsafe fn create_pipeline(device: &Device, data: &mut AppData) -> Result<()> {
 		.viewport_state(&viewport_state)
 		.rasterization_state(&rasterization_state)
 		.multisample_state(&multisample_state)
+		.depth_stencil_state(&depth_stencil_state)
 		.color_blend_state(&color_blend_state)
 		.layout(data.pipeline_layout)
 		.render_pass(data.render_pass)
@@ -1045,7 +1168,7 @@ unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()>
 		.swapchain_image_views
 		.iter()
 		.map(|i| {
-			let attachments = &[*i];
+			let attachments = &[*i, data.depth_image_view];
 			let create_info = vk::FramebufferCreateInfo::builder()
 				.render_pass(data.render_pass)
 				.attachments(attachments)
@@ -1056,6 +1179,7 @@ unsafe fn create_framebuffers(device: &Device, data: &mut AppData) -> Result<()>
 			device.create_framebuffer(&create_info, None)
 		})
 		.collect::<Result<Vec<_>, _>>()?;
+
 	Ok(())
 }
 
@@ -1097,6 +1221,8 @@ struct AppData {
 	render_finished_semaphores: Vec<vk::Semaphore>,
 	in_flight_fences: Vec<vk::Fence>,
 	images_in_flight: Vec<vk::Fence>,
+	vertices: Vec<Vertex>,
+	indices: Vec<u32>,
 	vertex_buffer: vk::Buffer,
 	vertex_buffer_memory: vk::DeviceMemory,
 	index_buffer: vk::Buffer,
@@ -1109,6 +1235,10 @@ struct AppData {
 	texture_image_memory: vk::DeviceMemory,
 	texture_image_view: vk::ImageView,
 	texture_sampler: vk::Sampler,
+	depth_image: vk::Image,
+	depth_image_memory: vk::DeviceMemory,
+	depth_image_view: vk::ImageView,
+
 }
 
 #[repr(C)]
@@ -1418,7 +1548,6 @@ fn get_swapchain_extent(window: &Window, capabilities: vk::SurfaceCapabilitiesKH
 	}
 }
 
-// @See https://kylemayes.github.io/vulkanalia/presentation/swapchain.html
 unsafe fn create_swapchain(window: &Window, instance: &Instance, device: &Device, data: &mut AppData, ) -> Result<()> {
 	let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
 	let support = SwapchainSupport::get(instance, data, data.physical_device)?;
@@ -1469,7 +1598,7 @@ unsafe fn create_swapchain_image_views(device: &Device, data: &mut AppData) -> R
 	data.swapchain_image_views = data
 		.swapchain_images
 		.iter()
-		.map(|i| create_image_view(device, *i, data.swapchain_format))
+		.map(|i| create_image_view(device, *i, data.swapchain_format, vk::ImageAspectFlags::COLOR))
 		.collect::<Result<Vec<_>, _>>()?;
 
 	Ok(())
@@ -1478,13 +1607,13 @@ unsafe fn create_swapchain_image_views(device: &Device, data: &mut AppData) -> R
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 struct Vertex {
-	pos: glm::Vec2,
+	pos: glm::Vec3,
 	colour: glm::Vec3,
 	tex_coord: glm::Vec2,
 }
 
 impl Vertex {
-	fn new(pos: glm::Vec2, colour: glm::Vec3, tex_coord: glm::Vec2) -> Self {
+	fn new(pos: glm::Vec3, colour: glm::Vec3, tex_coord: glm::Vec2) -> Self {
 		Self { pos, colour, tex_coord }
 	}
 
@@ -1500,7 +1629,7 @@ impl Vertex {
 		let pos = vk::VertexInputAttributeDescription::builder()
 			.binding(0)
 			.location(0)
-			.format(vk::Format::R32G32_SFLOAT)
+			.format(vk::Format::R32G32B32_SFLOAT)
 			.offset(0)
 			.build();
 
@@ -1508,17 +1637,39 @@ impl Vertex {
 			.binding(0)
 			.location(1)
 			.format(vk::Format::R32G32B32_SFLOAT)
-			.offset(size_of::<glm::Vec2>() as u32)
+			.offset(size_of::<glm::Vec3>() as u32)
 			.build();
 
 		let tex_coord = vk::VertexInputAttributeDescription::builder()
 			.binding(0)
 			.location(2)
 			.format(vk::Format::R32G32_SFLOAT)
-			.offset((size_of::<glm::Vec2>() + size_of::<glm::Vec3>()) as u32)
+			.offset((size_of::<glm::Vec3>() + size_of::<glm::Vec3>()) as u32)
 			.build();
 
 		[pos, colour, tex_coord]
 	}
 }
 
+impl PartialEq for Vertex {
+	fn eq(&self, other: &Self) -> bool {
+		self.pos == other.pos
+			&& self.colour == other.colour
+			&& self.tex_coord == other.tex_coord
+	}
+}
+
+impl Eq for Vertex {}
+
+impl Hash for Vertex {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.pos[0].to_bits().hash(state);
+		self.pos[1].to_bits().hash(state);
+		self.pos[2].to_bits().hash(state);
+		self.colour[0].to_bits().hash(state);
+		self.colour[1].to_bits().hash(state);
+		self.colour[2].to_bits().hash(state);
+		self.tex_coord[0].to_bits().hash(state);
+		self.tex_coord[1].to_bits().hash(state);
+	}
+}
